@@ -71,9 +71,13 @@ def test_diag(tmp_path: Path) -> None:
         code = wintypes.DWORD()
         k.GetExitCodeProcess(h, ctypes.byref(code))
         rec['exit_code'] = code.value
-        rec['tasklist_alive_after'] = _alive(pid)
         rec['ran'] = (Path(str(hold) + '.pid')).exists()
-        k.CloseHandle(h)
+        k.CloseHandle(h)   # unpin the pid, exactly as the base test never pinned it
+        time.sleep(3)      # the base test's window
+        row = subprocess.run(['tasklist', '/FI', f'PID eq {pid}', '/NH', '/FO', 'CSV'],
+                             capture_output=True, text=True, check=False).stdout.strip()
+        rec['base_probe_alive_after_3s'] = str(pid) in row
+        rec['row_after_3s'] = row if str(pid) in row else ''
     finally:
         if lock:
             lock.release()
@@ -83,3 +87,45 @@ def test_diag(tmp_path: Path) -> None:
             script.wait()
         with open(ROOT / '.wine2e-diag.jsonl', 'a', encoding='utf-8') as f:
             f.write(json.dumps(rec) + '\n')
+
+
+@pytest.mark.platforms('windows')
+def test_reuse(tmp_path: Path) -> None:
+    """Base probe vs a recycled pid: after the child is confirmed dead and nothing pins its pid,
+    churn short-lived processes until one takes the pid, then ask the base probe."""
+    import sys
+    k = ctypes.WinDLL('kernel32', use_last_error=True)
+    k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k.OpenProcess.restype = wintypes.HANDLE
+    k.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    k.WaitForSingleObject.restype = wintypes.DWORD
+    rec = {'test': 'reuse'}
+    for pinned in (False, True):
+        victim = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'])
+        pid = victim.pid
+        h = k.OpenProcess(0x00100000 | 0x1000, False, pid)
+        victim.kill(); victim.wait()
+        assert k.WaitForSingleObject(h, 10000) == 0
+        victim._handle.Close()   # Popen's own handle would pin the pid too
+        if not pinned:
+            k.CloseHandle(h)
+        hit = None
+        live = []
+        for i in range(3000):
+            p = subprocess.Popen(['cmd.exe', '/d', '/c', 'ping -n 30 127.0.0.1 >NUL'], stdout=subprocess.DEVNULL)
+            if p.pid == pid:
+                hit = i; live.append(p); break
+            if len(live) < 400:
+                live.append(p)
+            else:
+                p.kill()
+        rec[f'pinned={pinned}'] = {'reused_after': hit, 'base_probe_says_alive': _alive(pid),
+                                   'handle_says_exited': (k.WaitForSingleObject(h, 0) == 0) if pinned else None}
+        if pinned:
+            k.CloseHandle(h)
+        for p in live:
+            p.kill()
+        for p in live:
+            p.wait()
+    with open(ROOT / '.wine2e-diag.jsonl', 'a', encoding='utf-8') as f:
+        f.write(json.dumps(rec) + '\n')
