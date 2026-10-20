@@ -43,7 +43,7 @@ jobs:
   venv-holder-e2e:
     name: venv-holder live E2E (windows-latest)
     runs-on: blacksmith-32vcpu-windows-2025
-    timeout-minutes: 25
+    timeout-minutes: 100
     steps:
       - name: Checkout code
         uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
@@ -59,51 +59,35 @@ jobs:
           test-environment: 'true'
           prune-python-cache: true
 
-      - name: Run venv-holder live E2E
-        # Canonical runner (scripts/run_tests.sh) — never bare pytest: it
-        # enforces credential hygiene, TZ, temp HERMES_HOME and subprocess
-        # isolation. The live files are host-marked windows-only, so the
-        # runner collects them on this runner instead of skipping them.
+      - name: TEMP marker-lock loop (never merges)
+        timeout-minutes: 80
         shell: bash
         run: |
-          set -uo pipefail
-          bash scripts/run_tests.sh \
-            tests/hermes_cli/test_venv_holder_windows_live.py \
-            tests/hermes_cli/test_taskkill_identity_windows_live.py \
-            tests/hermes_cli/test_git_trampoline_windows_live.py \
-            tests/pm/test_held_entry_windows_live.py
-
-      - name: Run Telegram CLOSE-WAIT reconnect live E2E (#87057)
-        shell: bash
-        run: |
-          set -uo pipefail
-          bash scripts/run_tests.sh tests/gateway/test_telegram_closewait_windows_live.py
-
-      - name: Run background-executor spawn parity live E2E (#70716)
-        shell: bash
-        run: |
-          set -uo pipefail
-          bash scripts/run_tests.sh tests/tools/test_process_registry_windows_live.py
-
-      - name: Turn Windows long paths off for later steps (#130242)
-        # The runner image turns LongPathsEnabled on; 0 is the Windows default
-        # most users have. A process reads the value when it starts, so only
-        # later steps see it. Keep this step after every lane that expects the
-        # image's setting. It does not depend on those lanes passing.
-        id: long_paths_off
-        if: ${{ !cancelled() }}
-        shell: pwsh
-        run: |
-          reg add 'HKLM\SYSTEM\CurrentControlSet\Control\FileSystem' /v LongPathsEnabled /t REG_DWORD /d 0 /f
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem').LongPathsEnabled
-
-      - name: Run PM long-path live E2E with long paths off (#130242)
-        # The test first asserts RtlAreLongPathsEnabled() is false in its own
-        # process, so this step cannot pass if the step above did not take.
-        # ``-m`` replaces pyproject's addopts, which deselect ``integration``.
-        if: ${{ !cancelled() && steps.long_paths_off.outcome == 'success' }}
-        shell: bash
-        run: |
-          set -uo pipefail
-          bash scripts/run_tests.sh tests/pm/test_long_paths_windows_live.py -- -m "platforms and integration" -v
+          set -u
+          F=tests/scripts/desktop_update/test_desktop_update_windows_marker_lock.py
+          D=tests/scripts/desktop_update/test_desktop_update_windows_zz_diag.py
+          export HERMES_TEST_FILE_RETRIES=0
+          # warm the env once, serially
+          bash scripts/run_tests.sh "$F" -- -m "platforms and not integration" -k test_script_killed > "$RUNNER_TEMP/warm.log" 2>&1; echo "warm rc=$?"; grep -a "Summary\|passed\|failed" "$RUNNER_TEMP/warm.log" | tail -3
+          # CI-like load: the lane runs 16 PowerShell-heavy files at once
+          SPIN=()
+          for s in $(seq 1 20); do python -c "while True: pass" & SPIN+=($!); done
+          W=()
+          for w in 1 2 3 4; do
+            (
+              for i in 1 2 3 4 5 6; do
+                bash scripts/run_tests.sh "$F" "$D" -- -m "platforms and not integration" -k "test_script_killed or test_diag" -v --tb=short > "$RUNNER_TEMP/w$w-$i.log" 2>&1
+                echo "w$w-$i rc=$?"
+              done
+            ) & W+=($!)
+          done
+          for p in "${W[@]}"; do wait "$p"; done
+          kill "${SPIN[@]}" 2>/dev/null
+          N=0; K=0
+          for f in "$RUNNER_TEMP"/w*-*.log; do
+            if grep -aqE "✗ tests.scripts.desktop_update.test_desktop_update_windows_marker_lock.py" "$f"; then N=$((N+1)); K=$((K+1)); echo "--- FAIL in $f"; grep -aE "E   |Error" "$f" | head -8;
+            elif grep -aqE "✓ tests.scripts.desktop_update.test_desktop_update_windows_marker_lock.py" "$f"; then N=$((N+1));
+            else echo "--- NO RESULT in $f"; tail -20 "$f"; fi
+          done
+          echo "RESULT fails=$K/$N"
+          echo "DIAG lines:"; cat .wine2e-diag.jsonl 2>/dev/null; rm -f .wine2e-diag.jsonl
