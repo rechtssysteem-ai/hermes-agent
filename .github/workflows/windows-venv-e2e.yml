@@ -63,12 +63,12 @@ jobs:
         timeout-minutes: 80
         shell: bash
         run: |
-          set -u
+          set +e -u +o pipefail
           F=tests/scripts/desktop_update/test_desktop_update_windows_marker_lock.py
           D=tests/scripts/desktop_update/test_desktop_update_windows_zz_diag.py
           export HERMES_TEST_FILE_RETRIES=0
           # warm the env once, serially
-          bash scripts/run_tests.sh "$F" -- -m "platforms and not integration" -k test_script_killed > "$RUNNER_TEMP/warm.log" 2>&1; echo "warm rc=$?"; grep -a "Summary\|passed\|failed" "$RUNNER_TEMP/warm.log" | tail -3
+          bash scripts/run_tests.sh "$F" -- -m "platforms and not integration" -k test_script_killed > "$RUNNER_TEMP/warm.log" 2>&1; echo "warm rc=$?"; tail -40 "$RUNNER_TEMP/warm.log"
           # CI-like load: the lane runs 16 PowerShell-heavy files at once
           SPIN=()
           for s in $(seq 1 20); do python -c "while True: pass" & SPIN+=($!); done
