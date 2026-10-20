@@ -71,11 +71,12 @@ jobs:
           bash scripts/run_tests.sh "$F" -- -m "platforms and not integration" -k test_script_killed > "$RUNNER_TEMP/warm.log" 2>&1; echo "warm rc=$?"; tail -40 "$RUNNER_TEMP/warm.log"
           # CI-like load: the lane runs 16 PowerShell-heavy files at once
           SPIN=()
-          for s in $(seq 1 20); do python -c "while True: pass" & SPIN+=($!); done
+          for s in $(seq 1 8); do python -c "while True: pass" & SPIN+=($!); done
+          for s in 1 2 3 4; do python -c "import subprocess, itertools; [subprocess.run(['cmd.exe', '/d', '/c', 'exit']) for _ in itertools.count()]" & SPIN+=($!); done
           W=()
           for w in 1 2 3 4; do
             (
-              for i in 1 2 3 4 5 6; do
+              for i in 1 2 3 4 5 6 7 8 9 10; do
                 bash scripts/run_tests.sh "$F" "$D" -- -m "platforms and not integration" -k "test_script_killed or test_diag" -v --tb=short > "$RUNNER_TEMP/w$w-$i.log" 2>&1
                 echo "w$w-$i rc=$?"
               done
@@ -83,11 +84,14 @@ jobs:
           done
           for p in "${W[@]}"; do wait "$p"; done
           kill "${SPIN[@]}" 2>/dev/null
-          N=0; K=0
+          N=0; K=0; O=0
           for f in "$RUNNER_TEMP"/w*-*.log; do
-            if grep -aqE "✗ tests.scripts.desktop_update.test_desktop_update_windows_marker_lock.py" "$f"; then N=$((N+1)); K=$((K+1)); echo "--- FAIL in $f"; grep -aE "E   |Error" "$f" | head -8;
+            if grep -aq "outlived its script" "$f"; then N=$((N+1)); K=$((K+1)); echo "--- LINE145 FAIL in $f"; grep -aE "E   " "$f" | head -4;
+            elif grep -aqE "✗ tests.scripts.desktop_update.test_desktop_update_windows_marker_lock.py" "$f"; then N=$((N+1)); O=$((O+1)); echo "--- OTHER FAIL in $f"; grep -aE "E   " "$f" | head -2;
             elif grep -aqE "✓ tests.scripts.desktop_update.test_desktop_update_windows_marker_lock.py" "$f"; then N=$((N+1));
             else echo "--- NO RESULT in $f"; tail -20 "$f"; fi
           done
-          echo "RESULT fails=$K/$N"
+          echo "OTHER (non-line-145) fails=$O/$N"
+          echo "RESULT child-outlived fails=$K/$N"
+          bash scripts/run_tests.sh "$D" -- -m "platforms and not integration" -k test_reuse -v --tb=short > "$RUNNER_TEMP/reuse.log" 2>&1; echo "reuse rc=$?"; grep -aE "PASSED|FAILED|E   " "$RUNNER_TEMP/reuse.log" | head
           echo "DIAG lines:"; cat .wine2e-diag.jsonl 2>/dev/null; rm -f .wine2e-diag.jsonl
